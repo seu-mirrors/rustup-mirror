@@ -5,10 +5,8 @@ on:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
     container: almalinux:8
-
     steps:
     - uses: actions/checkout@v2
     - name: Build
