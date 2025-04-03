@@ -10,6 +10,8 @@ jobs:
     steps:
     - uses: actions/checkout@v2
     - uses: actions-rust-lang/setup-rust-toolchain@v1
+    - name: Deps setup
+      run: dnf -y install gcc openssl-devel
     - name: Build
       run: cargo build --release
     - uses: actions/upload-artifact@v4
