@@ -8,7 +8,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use ring::digest;
 use std::collections::HashSet;
 use std::fs::{copy, create_dir_all, read_dir, remove_dir_all, remove_file, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use toml::Value;
 use url::Url;
@@ -292,6 +292,8 @@ const TARGETS: [&str; 271] = [
 
 const DEFAULT_UPSTREAM_URL: &str = "https://static.rust-lang.org/";
 
+const MAX_RETRIES: i32 = 3;
+
 fn file_sha256(file_path: &Path) -> Option<String> {
     let file = Path::new(file_path);
     if file.exists() {
@@ -304,35 +306,77 @@ fn file_sha256(file_path: &Path) -> Option<String> {
 
 fn download(upstream_url: &str, dir: &str, path: &str) -> Result<PathBuf, Error> {
     let manifest = format!("{}{}", upstream_url, path);
-    let mut response = reqwest::blocking::get(&manifest)?;
+    let mut response;
     let mirror = Path::new(dir);
     let file_path = mirror.join(&path);
     create_dir_all(file_path.parent().unwrap())?;
     let mut dest = File::create(file_path)?;
+    let mut attempts = 0;
 
-    println!("File /{} downloading", path);
-    let length = match response.content_length() {
-        None => return Err(anyhow!("Not found")),
-        Some(l) => l,
-    };
-    let pb = ProgressBar::new(length);
-    pb.set_style(ProgressStyle::default_bar()
+    'outer: loop {
+        attempts += 1;
+        match reqwest::blocking::get(&manifest) {
+            Ok(res) => {
+                response = res;
+            }
+            Err(e) => {
+                if attempts >= MAX_RETRIES {
+                    return Err(anyhow!(
+                        "Failed to download after {} attempts: {}",
+                        MAX_RETRIES,
+                        e.to_string()
+                    ));
+                }
+                println!("Attempt {} failed: {}. Retrying...", attempts, e);
+                continue 'outer;
+            }
+        }
+
+        println!("File /{} downloading", path);
+        let length = match response.content_length() {
+            None => return Err(anyhow!("Not found")),
+            Some(l) => l,
+        };
+        let pb = ProgressBar::new(length);
+        pb.set_style(ProgressStyle::default_bar()
         .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} (ETA {eta_precise})")?
         .progress_chars("#>-"));
 
-    let mut buffer = [0u8; 4096];
-    let mut read = 0;
+        let mut buffer = [0u8; 4096];
+        let mut read = 0;
 
-    while read < length {
-        let len = response.read(&mut buffer)?;
-        dest.write_all(&buffer[..len])?;
-        read += len as u64;
-        pb.set_position(read);
+        while read < length {
+            match response.read(&mut buffer) {
+                Ok(len) => {
+                    dest.write_all(&buffer[..len])?;
+                    read += len as u64;
+                    pb.set_position(read);
+                }
+                Err(e) => {
+                    if attempts >= MAX_RETRIES {
+                        return Err(anyhow!(
+                            "Failed to read response after {} attempts: {}",
+                            MAX_RETRIES,
+                            e.to_string()
+                        ));
+                    }
+                    println!(
+                        "Attempt {} to read response failed: {}. Retrying...",
+                        attempts, e
+                    );
+                    dest.rewind()?;
+                    pb.finish_and_clear();
+                    continue 'outer;
+                }
+            }
+        }
+
+        pb.finish_and_clear();
+        println!("File /{} downloaded", path);
+        break;
     }
 
-    pb.finish_and_clear();
-    println!("File /{} downloaded", path);
-    Ok(mirror.join(path))
+    return Ok(mirror.join(path));
 }
 
 #[derive(Parser)]
@@ -475,9 +519,23 @@ fn main() {
                         };
 
                         if need_download {
-                            download(upstream_url, mirror_path, &file_name[1..]).unwrap();
-                            hash_file_cont = file_sha256(file.as_path());
-                            assert_eq!(Some(chksum_upstream), hash_file_cont.as_deref());
+                            let mut attempts = 0;
+                            loop {
+                                attempts += 1;
+                                download(upstream_url, mirror_path, &file_name[1..]).unwrap();
+                                hash_file_cont = file_sha256(file.as_path());
+                                if Some(chksum_upstream) == hash_file_cont.as_deref() {
+                                    break;
+                                }
+                                if attempts >= MAX_RETRIES {
+                                    panic!(
+                                        "Failed to pass checksum after {} attempts",
+                                        MAX_RETRIES
+                                    );
+                                }
+                                println!("Checksum attempt {} failed. Retrying...", attempts);
+                            }
+                            // assert_eq!(Some(chksum_upstream), hash_file_cont.as_deref());
                         } else {
                             println!("File {} already downloaded, skipping", file_name);
                         }
